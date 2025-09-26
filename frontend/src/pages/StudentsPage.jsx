@@ -3,6 +3,7 @@ import { Container, Typography, Box, TextField, MenuItem, Chip, Stack, Drawer, L
 import { DataGrid } from '@mui/x-data-grid';
 import CloseIcon from '@mui/icons-material/Close';
 import api from '../services/api';
+import { useAuth } from '../context/AuthContext';
 
 const StudentsPage = () => {
   const [rows, setRows] = useState([]);
@@ -20,14 +21,39 @@ const StudentsPage = () => {
   const [drawerData, setDrawerData] = useState({ name: '', missingDetails: [] });
 
 
+  const { user } = useAuth();
+
   const load = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await api.get('/reports/students-overview');
-      const data = (res.data?.data || []).map(s => ({
-        ...s,
-        id: s.userId,
-      }));
+      let data = [];
+      if (user?.role === 'coordinator') {
+        // Trigger a quick roster sync to ensure we include newly discovered rosters
+        try { await api.post('/reports/coordinator/sync-roster'); } catch (e) { /* ignore to avoid blocking UI */ }
+        // Incluye todos los alumnos desde la matrícula cacheada (course_students)
+        const res = await api.get('/reports/coordinator/students');
+        const rows = res.data?.data || [];
+        data = rows.map(r => ({
+          userId: r.userId,
+          name: r.name || '—',
+          email: r.email || '—',
+          courses: r.courses || [],
+          totalAssignments: 0,
+          submittedCount: 0,
+          missingCount: 0,
+          averageGrade: null,
+          missingDetails: [],
+          id: r.userId,
+        }));
+      } else {
+        // Vista original (profesor): basado en API en vivo y submissions
+        const res = await api.get('/reports/students-overview');
+        const rows = res.data?.data || [];
+        data = rows.map(s => ({
+          ...s,
+          id: s.userId,
+        }));
+      }
       setRows(data);
       setError(null);
     } catch (err) {
@@ -36,7 +62,7 @@ const StudentsPage = () => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [user]);
 
   useEffect(() => { load(); }, [load]);
 

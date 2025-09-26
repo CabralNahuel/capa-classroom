@@ -10,6 +10,7 @@ const CoordinatorPage = () => {
   const [roleFilter, setRoleFilter] = useState('all');
   const [q, setQ] = useState('');
 
+
   const load = useCallback(async () => {
     try {
       setLoading(true);
@@ -40,6 +41,7 @@ const CoordinatorPage = () => {
     }
   };
 
+
   const columns = useMemo(() => ([
     { field: 'name', headerName: 'Nombre', flex: 1, minWidth: 180 },
     { field: 'email', headerName: 'Email', flex: 1, minWidth: 200, valueGetter: (p) => p.row.email || '—' },
@@ -67,6 +69,7 @@ const CoordinatorPage = () => {
     }
   ]), []);
 
+
   return (
     <Container maxWidth="lg">
       <Typography variant="h4" gutterBottom>Panel de Coordinación</Typography>
@@ -91,6 +94,7 @@ const CoordinatorPage = () => {
           <DataGrid rows={rows} columns={columns} pageSize={25} rowsPerPageOptions={[25, 50, 100]} density="compact" autoHeight rowHeight={56} />
         </div>
       )}
+
     </Container>
   );
 };

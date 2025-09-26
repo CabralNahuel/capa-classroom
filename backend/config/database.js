@@ -99,6 +99,38 @@ async function initializeDatabase() {
       )
     `);
 
+    // Create course_students table (roster cache)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS course_students (
+        id SERIAL PRIMARY KEY,
+        course_id VARCHAR(255) NOT NULL,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        google_id VARCHAR(255),
+        name VARCHAR(255),
+        email VARCHAR(255),
+        cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(course_id, user_id)
+      )
+    `);
+
+    // Ensure columns exist for backward compatibility
+    await client.query(`
+      DO $$ BEGIN
+        BEGIN
+          ALTER TABLE course_students ALTER COLUMN user_id DROP NOT NULL;
+        EXCEPTION WHEN undefined_object THEN NULL; END;
+        BEGIN
+          ALTER TABLE course_students ADD COLUMN IF NOT EXISTS google_id VARCHAR(255);
+        EXCEPTION WHEN duplicate_column THEN NULL; END;
+        BEGIN
+          ALTER TABLE course_students ADD COLUMN IF NOT EXISTS name VARCHAR(255);
+        EXCEPTION WHEN duplicate_column THEN NULL; END;
+        BEGIN
+          ALTER TABLE course_students ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+        EXCEPTION WHEN duplicate_column THEN NULL; END;
+      END $$;
+    `);
+
     // Create activity_logs table
     await client.query(`
       CREATE TABLE IF NOT EXISTS activity_logs (
@@ -124,6 +156,11 @@ async function initializeDatabase() {
       CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON submissions_cache(assignment_id);
       CREATE INDEX IF NOT EXISTS idx_activity_logs_user ON activity_logs(user_id);
       CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON activity_logs(created_at);
+      CREATE INDEX IF NOT EXISTS idx_course_students_course ON course_students(course_id);
+      CREATE INDEX IF NOT EXISTS idx_course_students_user ON course_students(user_id);
+      CREATE INDEX IF NOT EXISTS idx_course_students_google ON course_students(google_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_course_students_course_google 
+        ON course_students(course_id, google_id) WHERE google_id IS NOT NULL;
     `);
 
     logger.info('Database tables initialized successfully');

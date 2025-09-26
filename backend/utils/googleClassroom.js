@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 const { query } = require('../config/database');
 const logger = require('./logger');
+const googleDirectory = require('./googleDirectory');
 
 class GoogleClassroomService {
   constructor() {
@@ -24,7 +25,7 @@ class GoogleClassroomService {
 
       const courses = response.data.courses || [];
       for (const course of courses) {
-        await this.cacheCourse(course);
+        await this.cacheCourse(course, userId);
       }
       return courses;
     } catch (error) {
@@ -215,7 +216,16 @@ class GoogleClassroomService {
         courseId: courseId
       });
 
-      return response.data.students || [];
+      const students = response.data.students || [];
+
+      // Cache roster to course_students table
+      try {
+        await this.cacheCourseRoster(courseId, students);
+      } catch (e) {
+        logger.warn(`Failed to cache course roster for course ${courseId}: ${e.message}`);
+      }
+
+      return students;
     } catch (error) {
       logger.error('Failed to get students:', error);
       throw error;
@@ -276,20 +286,23 @@ class GoogleClassroomService {
   }
 
   // Cache course in database
-  async cacheCourse(course) {
+  async cacheCourse(course, localTeacherId = null) {
     try {
       await query(
         `INSERT INTO courses_cache 
-         (course_id, name, description, section, enrollment_code, course_state, creation_time, update_time)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         (course_id, name, description, section, teacher_id, enrollment_code, course_state, creation_time, update_time)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (course_id) DO UPDATE SET
-         name = $2, description = $3, section = $4, enrollment_code = $5, 
-         course_state = $6, update_time = $8, cached_at = CURRENT_TIMESTAMP`,
+         name = $2, description = $3, section = $4, 
+         teacher_id = COALESCE(courses_cache.teacher_id, $5),
+         enrollment_code = $6, 
+         course_state = $7, update_time = $9, cached_at = CURRENT_TIMESTAMP`,
         [
           course.id,
           course.name,
           course.description || null,
           course.section || null,
+          localTeacherId,
           course.enrollmentCode || null,
           course.courseState,
           course.creationTime ? new Date(course.creationTime) : null,
@@ -330,6 +343,12 @@ class GoogleClassroomService {
   // Cache submission in database
   async cacheSubmission(submission, assignmentId, courseId) {
     try {
+      // Derive assignment id if not provided (when caching bulk course submissions)
+      const derivedAssignmentId = assignmentId || submission?.courseWorkId || submission?.assignmentId;
+      if (!derivedAssignmentId) {
+        // Without assignment id we cannot enforce the unique key or relational integrity; skip
+        return;
+      }
       // Find user by Google ID
       const userResult = await query(
         'SELECT id FROM users WHERE google_id = $1',
@@ -347,7 +366,7 @@ class GoogleClassroomService {
          submission_time = $9, cached_at = CURRENT_TIMESTAMP`,
         [
           submission.id,
-          assignmentId,
+          derivedAssignmentId,
           courseId,
           userId,
           submission.state,
@@ -359,6 +378,95 @@ class GoogleClassroomService {
       );
     } catch (error) {
       logger.error('Failed to cache submission:', error);
+    }
+  }
+
+  // Cache course roster (students) into course_students
+  async cacheCourseRoster(courseId, students) {
+    try {
+      for (const s of students) {
+        const googleId = String(s.userId);
+        const profile = s.profile || {};
+        const email = profile.emailAddress || null;
+        const name = profile.name?.fullName || null;
+        const domain = email ? email.split('@')[1] : null;
+
+        // Resolve or upsert user to get internal user_id
+        let userIdInternal = null;
+        try {
+          // Try existing by google_id or email
+          let res = await query(
+            'SELECT id FROM users WHERE google_id = $1 OR email = $2 LIMIT 1',
+            [googleId, email]
+          );
+          if (res.rows.length > 0) {
+            userIdInternal = res.rows[0].id;
+          } else {
+            // If we don't have email, try Admin SDK to backfill
+            let finalEmail = email;
+            let finalName = name;
+            if (!finalEmail) {
+              try {
+                const dirUser = await googleDirectory.getUserById(googleId);
+                if (dirUser?.primaryEmail) {
+                  finalEmail = dirUser.primaryEmail;
+                  finalName = finalName || dirUser.name?.fullName || null;
+                }
+              } catch {/* ignore */}
+            }
+
+            // Insert only if we have required fields (users.email and users.name are NOT NULL)
+            if (finalEmail && (finalName && finalName.trim().length > 0)) {
+              const ins = await query(
+                `INSERT INTO users (google_id, email, name, domain)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (google_id)
+                 DO UPDATE SET email = EXCLUDED.email, name = COALESCE(EXCLUDED.name, users.name)
+                 RETURNING id`,
+                [googleId, finalEmail, finalName, domain]
+              );
+              userIdInternal = ins.rows[0].id;
+            }
+          }
+        } catch (e) {
+          logger.warn(`cacheCourseRoster user upsert failed for ${googleId}: ${e.message}`);
+        }
+
+        if (userIdInternal) {
+          // Insert or update by user_id key, also backfill google/name/email
+          try {
+            await query(
+              `INSERT INTO course_students (course_id, user_id, google_id, name, email)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (course_id, user_id) DO UPDATE SET
+               google_id = COALESCE(course_students.google_id, EXCLUDED.google_id),
+               name = COALESCE(EXCLUDED.name, course_students.name),
+               email = COALESCE(EXCLUDED.email, course_students.email),
+               cached_at = CURRENT_TIMESTAMP`,
+              [String(courseId), userIdInternal, googleId, name, email]
+            );
+          } catch (e) {
+            logger.warn(`cacheCourseRoster insert by user_id failed for course ${courseId}, user ${userIdInternal}: ${e.message}`);
+          }
+        } else {
+          // No users row; store by google_id with name/email so coordinator views still work
+          try {
+            await query(
+              `INSERT INTO course_students (course_id, google_id, name, email)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (course_id, google_id) DO UPDATE SET
+               name = COALESCE(EXCLUDED.name, course_students.name),
+               email = COALESCE(EXCLUDED.email, course_students.email),
+               cached_at = CURRENT_TIMESTAMP`,
+              [String(courseId), googleId, name, email]
+            );
+          } catch (e) {
+            logger.warn(`cacheCourseRoster insert by google_id failed for course ${courseId}, google_id ${googleId}: ${e.message}`);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to cache course roster:', error);
     }
   }
 }

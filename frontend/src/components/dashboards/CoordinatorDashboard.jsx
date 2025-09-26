@@ -5,6 +5,9 @@ import api from '../../services/api';
 
 const CoordinatorDashboard = () => {
   const [stats, setStats] = useState(null);
+  const [byCourse, setByCourse] = useState([]);
+  const [byStudent, setByStudent] = useState([]);
+  const [byTeacher, setByTeacher] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -14,6 +17,16 @@ const CoordinatorDashboard = () => {
         setLoading(true);
         const statsRes = await api.get('/reports/dashboard/overview');
         setStats(statsRes.data.data);
+
+        // Load analytics datasets
+        const [cRes, sRes, tRes] = await Promise.all([
+          api.get('/reports/analytics/courses'),
+          api.get('/reports/analytics/students'),
+          api.get('/reports/analytics/teachers')
+        ]);
+        setByCourse(cRes.data?.data || []);
+        setByStudent(sRes.data?.data || []);
+        setByTeacher(tRes.data?.data || []);
         setError(null);
       } catch (err) {
         setError('No se pudieron cargar los datos del tablero.');
@@ -69,18 +82,19 @@ const CoordinatorDashboard = () => {
         </Card>
       </Grid>
 
+      {/* Completion rate by course */}
       <Grid item xs={12} md={8}>
         <Card>
           <CardContent>
-            <Typography variant="h5" gutterBottom>Actividad reciente</Typography>
+            <Typography variant="h5" gutterBottom>Porcentaje de entregas por curso</Typography>
             <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={stats?.recentActivity.reverse()}>
+              <BarChart data={byCourse}>
                 <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="date" />
-                <YAxis />
+                <XAxis dataKey="course_name" hide={false} interval={0} angle={-20} textAnchor="end" height={80} />
+                <YAxis domain={[0, 100]} />
                 <Tooltip />
                 <Legend />
-                <Bar dataKey="activity_count" fill="#8884d8" name="Actividades" />
+                <Bar dataKey="completion_rate" fill="#1976d2" name="% Entregas" />
               </BarChart>
             </ResponsiveContainer>
           </CardContent>
@@ -102,8 +116,46 @@ const CoordinatorDashboard = () => {
           </CardContent>
         </Card>
       </Grid>
+
+      {/* Completion rate by student */}
+      <Grid item xs={12} md={6}>
+        <Card>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>% de entregas por alumno</Typography>
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={byStudent.slice(0, 10)}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="student_name" hide={false} interval={0} angle={-20} textAnchor="end" height={80} />
+                <YAxis domain={[0, 100]} />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="completion_rate" fill="#43a047" name="% Entregas" />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      </Grid>
+
+      {/* Completion rate by teacher */}
+      <Grid item xs={12} md={6}>
+        <Card>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>% de entregas por docente</Typography>
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={byTeacher}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="teacher_name" hide={false} interval={0} angle={-20} textAnchor="end" height={80} />
+                <YAxis domain={[0, 100]} />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="completion_rate" fill="#ef6c00" name="% Entregas" />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      </Grid>
     </Grid>
   );
-};
+}
 
 export default CoordinatorDashboard;

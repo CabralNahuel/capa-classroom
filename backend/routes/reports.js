@@ -431,7 +431,7 @@ router.get('/course-performance/:courseId',
         ORDER BY a.due_date DESC NULLS LAST
       `, [courseId]);
       
-      // Get student performance in course
+      // Get student performance in course (include students without submissions via course_students)
       const studentPerformance = await query(`
         SELECT 
           u.id,
@@ -445,11 +445,11 @@ router.get('/course-performance/:courseId',
             WHEN s.draft_grade IS NOT NULL THEN s.draft_grade
             ELSE NULL
           END) as average_grade
-        FROM users u
-        LEFT JOIN submissions_cache s ON u.id = s.user_id AND s.course_id = $1
-        WHERE u.role = 'student'
+        FROM course_students cs
+        JOIN users u ON cs.user_id = u.id
+        LEFT JOIN submissions_cache s ON s.user_id = cs.user_id AND s.course_id = cs.course_id
+        WHERE cs.course_id = $1 AND u.role = 'student'
         GROUP BY u.id, u.name, u.email
-        HAVING COUNT(s.submission_id) > 0
         ORDER BY average_grade DESC NULLS LAST
       `, [courseId]);
       
@@ -467,6 +467,294 @@ router.get('/course-performance/:courseId',
         success: false,
         error: 'Failed to fetch course performance report'
       });
+    }
+  }
+);
+
+// Analytics: completion rate by course
+router.get('/analytics/courses', 
+  requireCoordinator, 
+  logActivity('GET_ANALYTICS_COURSES'), 
+  async (req, res) => {
+    try {
+      const result = await query(`
+        WITH assigns AS (
+          SELECT course_id, COUNT(*) AS assignments
+          FROM assignments_cache
+          WHERE state = 'PUBLISHED'
+          GROUP BY course_id
+        ),
+        students AS (
+          SELECT course_id, COUNT(DISTINCT COALESCE(user_id::text, google_id)) AS students
+          FROM course_students
+          GROUP BY course_id
+        ),
+        delivered AS (
+          SELECT course_id, COUNT(*) AS delivered
+          FROM submissions_cache
+          WHERE state IN ('TURNED_IN','RETURNED')
+          GROUP BY course_id
+        )
+        SELECT c.course_id,
+               c.name AS course_name,
+               COALESCE(a.assignments, 0) AS assignments,
+               COALESCE(s.students, 0) AS students,
+               COALESCE(d.delivered, 0) AS delivered,
+               CASE WHEN COALESCE(a.assignments,0) = 0 OR COALESCE(s.students,0) = 0 THEN 0
+                    ELSE ROUND( (COALESCE(d.delivered,0) * 100.0) / (a.assignments * s.students) ) END AS completion_rate
+        FROM courses_cache c
+        LEFT JOIN assigns a ON a.course_id = c.course_id
+        LEFT JOIN students s ON s.course_id = c.course_id
+        LEFT JOIN delivered d ON d.course_id = c.course_id
+        WHERE c.course_state = 'ACTIVE'
+        ORDER BY completion_rate DESC, course_name ASC
+      `);
+      res.json({ success: true, data: result.rows, count: result.rows.length });
+    } catch (error) {
+      logger.error('Analytics courses error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch course analytics' });
+    }
+  }
+);
+
+// Analytics: completion rate by student (across their courses)
+router.get('/analytics/students', 
+  requireCoordinator, 
+  logActivity('GET_ANALYTICS_STUDENTS'), 
+  async (req, res) => {
+    try {
+      const result = await query(`
+        WITH per_course AS (
+          SELECT 
+            cs.course_id,
+            COALESCE(u.id::text, cs.google_id) AS student_key,
+            COALESCE(u.name, cs.name) AS student_name,
+            COALESCE(u.email, cs.email) AS student_email,
+            (SELECT COUNT(*) FROM assignments_cache a WHERE a.course_id = cs.course_id AND a.state='PUBLISHED') AS assignments
+          FROM course_students cs
+          LEFT JOIN users u ON u.id = cs.user_id
+        ),
+        delivered AS (
+          SELECT course_id, user_id, COUNT(*) AS delivered
+          FROM submissions_cache
+          WHERE state IN ('TURNED_IN','RETURNED')
+          GROUP BY course_id, user_id
+        )
+        SELECT p.student_key,
+               MAX(p.student_name) AS student_name,
+               MAX(p.student_email) AS student_email,
+               COALESCE(SUM(p.assignments),0) AS total_assignments,
+               COALESCE(SUM(CASE WHEN d.delivered IS NOT NULL THEN d.delivered ELSE 0 END),0) AS delivered,
+               CASE WHEN COALESCE(SUM(p.assignments),0) = 0 THEN 0
+                    ELSE ROUND( (COALESCE(SUM(CASE WHEN d.delivered IS NOT NULL THEN d.delivered ELSE 0 END),0) * 100.0) / SUM(p.assignments) ) END AS completion_rate
+        FROM per_course p
+        LEFT JOIN delivered d ON d.course_id = p.course_id AND d.user_id::text = p.student_key
+        GROUP BY p.student_key
+        ORDER BY completion_rate DESC, student_name ASC
+      `);
+      res.json({ success: true, data: result.rows, count: result.rows.length });
+    } catch (error) {
+      logger.error('Analytics students error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch student analytics' });
+    }
+  }
+);
+
+// Analytics: completion rate by teacher (across their courses)
+router.get('/analytics/teachers', 
+  requireCoordinator, 
+  logActivity('GET_ANALYTICS_TEACHERS'), 
+  async (req, res) => {
+    try {
+      const result = await query(`
+        WITH assigns AS (
+          SELECT course_id, COUNT(*) AS assignments
+          FROM assignments_cache
+          WHERE state='PUBLISHED'
+          GROUP BY course_id
+        ),
+        students AS (
+          SELECT course_id, COUNT(DISTINCT COALESCE(user_id::text, google_id)) AS students
+          FROM course_students
+          GROUP BY course_id
+        ),
+        delivered AS (
+          SELECT c.course_id, COUNT(*) AS delivered
+          FROM submissions_cache c
+          WHERE state IN ('TURNED_IN','RETURNED')
+          GROUP BY c.course_id
+        )
+        SELECT 
+          COALESCE(u.id, c.teacher_id) AS teacher_id,
+          COALESCE(u.name, '(sin nombre)') AS teacher_name,
+          u.email AS teacher_email,
+          COALESCE(SUM(a.assignments),0) AS assignments,
+          COALESCE(SUM(s.students),0) AS students,
+          COALESCE(SUM(d.delivered),0) AS delivered,
+          CASE WHEN COALESCE(SUM(a.assignments),0) = 0 OR COALESCE(SUM(s.students),0) = 0 THEN 0
+               ELSE ROUND( (COALESCE(SUM(d.delivered),0) * 100.0) / (SUM(a.assignments) * SUM(s.students)) ) END AS completion_rate
+        FROM courses_cache c
+        LEFT JOIN users u ON u.id = c.teacher_id
+        LEFT JOIN assigns a ON a.course_id = c.course_id
+        LEFT JOIN students s ON s.course_id = c.course_id
+        LEFT JOIN delivered d ON d.course_id = c.course_id
+        WHERE c.teacher_id IS NOT NULL
+        GROUP BY COALESCE(u.id, c.teacher_id), COALESCE(u.name,'(sin nombre)'), u.email
+        ORDER BY completion_rate DESC, teacher_name ASC
+      `);
+      res.json({ success: true, data: result.rows, count: result.rows.length });
+    } catch (error) {
+      logger.error('Analytics teachers error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch teacher analytics' });
+    }
+  }
+);
+
+// Coordinators: list all distinct students from course_students with their courses
+router.get('/coordinator/students', 
+  requireCoordinator, 
+  logActivity('GET_COORDINATOR_STUDENTS'), 
+  async (req, res) => {
+    try {
+      const result = await query(`
+        SELECT 
+          COALESCE(u.id::text, cs.google_id) AS user_key,
+          COALESCE(u.name, cs.name) AS name,
+          COALESCE(u.email, cs.email) AS email,
+          ARRAY_AGG(DISTINCT jsonb_build_object('courseId', c.course_id, 'courseName', c.name)) AS courses
+        FROM course_students cs
+        JOIN courses_cache c ON c.course_id = cs.course_id
+        LEFT JOIN users u ON u.id = cs.user_id
+        GROUP BY 
+          COALESCE(u.id::text, cs.google_id),
+          COALESCE(u.name, cs.name),
+          COALESCE(u.email, cs.email)
+        ORDER BY name ASC NULLS LAST, email ASC
+      `);
+
+      const data = result.rows.map(r => ({
+        userId: r.user_key,
+        name: r.name || '—',
+        email: r.email || '—',
+        courses: (r.courses || []).map(j => ({ courseId: j.courseId || j.courseid || j.course_id, courseName: j.courseName || j.coursename || j.name }))
+      }));
+
+      res.json({ success: true, data, count: data.length });
+    } catch (error) {
+      logger.error('Coordinator students list error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch students' });
+    }
+  }
+);
+
+// Coordinators: sync a teacher's courses to populate courses_cache.teacher_id
+router.post('/coordinator/sync-teacher-courses/:teacherId',
+  requireCoordinator,
+  logActivity('POST_COORDINATOR_SYNC_TEACHER_COURSES'),
+  async (req, res) => {
+    try {
+      const { teacherId } = req.params;
+      // This will fetch courses using the teacher's OAuth tokens and cache them with teacher_id
+      const courses = await googleClassroom.getTeacherCourses(teacherId);
+      res.json({ success: true, teacherId, courses: courses.length });
+    } catch (error) {
+      logger.error('Coordinator sync teacher courses error:', error);
+      res.status(500).json({ success: false, error: 'Failed to sync teacher courses. Ensure the teacher logged in at least once.' });
+    }
+  }
+);
+
+// Teachers: list all their students across all their courses (from course_students)
+router.get('/teacher/students',
+  requireTeacherOrCoordinator,
+  logActivity('GET_TEACHER_STUDENTS'),
+  async (req, res) => {
+    try {
+      const teacherId = req.user.id;
+      const students = await query(`
+        SELECT DISTINCT 
+          COALESCE(u.id::text, cs.google_id) AS student_key,
+          COALESCE(u.name, cs.name) AS student_name,
+          COALESCE(u.email, cs.email) AS student_email
+        FROM courses_cache c
+        JOIN course_students cs ON cs.course_id = c.course_id
+        LEFT JOIN users u ON u.id = cs.user_id
+        WHERE c.teacher_id = $1
+        ORDER BY student_name ASC NULLS LAST, student_email ASC
+      `, [teacherId]);
+
+      // map to stable shape
+      const data = students.rows.map((r, idx) => ({ student_id: r.student_key, student_name: r.student_name, student_email: r.student_email }));
+      res.json({ success: true, data, count: data.length });
+    } catch (error) {
+      logger.error('Teacher students error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch teacher students' });
+    }
+  }
+);
+
+// Teachers: sync their roster across their active courses
+router.post('/teacher/sync-roster',
+  requireTeacherOrCoordinator,
+  logActivity('POST_TEACHER_SYNC_ROSTER'),
+  async (req, res) => {
+    try {
+      const teacherId = req.user.id;
+      const { rows: courses } = await query(`
+        SELECT course_id, name
+        FROM courses_cache
+        WHERE course_state = 'ACTIVE' AND teacher_id = $1
+      `, [teacherId]);
+
+      let processed = 0;
+      const errors = [];
+      for (const c of courses) {
+        try {
+          await googleClassroom.getStudents(teacherId, c.course_id);
+          processed += 1;
+        } catch (e) {
+          errors.push({ courseId: String(c.course_id), name: c.name, error: e.message });
+        }
+      }
+
+      res.json({ success: true, processed, total: courses.length, errors });
+    } catch (error) {
+      logger.error('Teacher sync roster error:', error);
+      res.status(500).json({ success: false, error: 'Failed to sync roster' });
+    }
+  }
+);
+
+// Coordinators: sync course roster cache (course_students) for active courses
+router.post('/coordinator/sync-roster',
+  requireCoordinator,
+  logActivity('POST_COORDINATOR_SYNC_ROSTER'),
+  async (req, res) => {
+    try {
+      // Get active courses and their teacher ids
+      const { rows: courses } = await query(`
+        SELECT course_id, name, teacher_id
+        FROM courses_cache
+        WHERE course_state = 'ACTIVE' AND teacher_id IS NOT NULL
+      `);
+
+      let processed = 0;
+      const errors = [];
+
+      for (const c of courses) {
+        try {
+          // Use the teacher account to fetch students from Classroom and cache roster
+          await googleClassroom.getStudents(c.teacher_id, c.course_id);
+          processed += 1;
+        } catch (e) {
+          errors.push({ courseId: String(c.course_id), name: c.name, error: e.message });
+        }
+      }
+
+      res.json({ success: true, processed, total: courses.length, errors });
+    } catch (error) {
+      logger.error('Coordinator sync roster error:', error);
+      res.status(500).json({ success: false, error: 'Failed to sync roster' });
     }
   }
 );
@@ -538,9 +826,21 @@ router.get('/dashboard/overview',
       // Get basic counts
       const basicStats = await query(`
         SELECT 
-          (SELECT COUNT(*) FROM users WHERE role = 'student') as total_students,
-          (SELECT COUNT(*) FROM users WHERE role = 'teacher') as total_teachers,
-          (SELECT COUNT(*) FROM courses_cache WHERE course_state = 'ACTIVE') as active_courses,
+          (
+            SELECT COUNT(DISTINCT COALESCE(cs.user_id::text, cs.google_id))
+            FROM course_students cs
+          ) as total_students,
+          (
+            SELECT COUNT(DISTINCT c.teacher_id)
+            FROM courses_cache c
+            WHERE c.teacher_id IS NOT NULL
+          ) as total_teachers,
+          (
+            SELECT COUNT(DISTINCT cs.course_id)
+            FROM course_students cs
+            JOIN courses_cache c ON c.course_id = cs.course_id
+            WHERE c.course_state = 'ACTIVE'
+          ) as active_courses,
           (SELECT COUNT(*) FROM assignments_cache WHERE state = 'PUBLISHED') as total_assignments
       `);
       
@@ -600,7 +900,6 @@ router.get('/dashboard/overview',
           END) as average_grade
         FROM users u
         JOIN submissions_cache s ON u.id = s.user_id
-        WHERE u.role = 'student'
         GROUP BY u.id, u.name, u.email
         HAVING 
           AVG(CASE 
@@ -642,7 +941,7 @@ router.get('/assignments/analytics',
     try {
       const { courseId, dateFrom, dateTo } = req.query;
       
-      let whereClause = 'WHERE a.state = \'PUBLISHED\'';
+      let whereClause = 'WHERE a.state = ' + "'PUBLISHED'";
       const params = [];
       let paramCount = 0;
       
@@ -693,6 +992,67 @@ router.get('/assignments/analytics',
         success: false,
         error: 'Failed to fetch assignment analytics'
       });
+    }
+  }
+);
+
+// Coordinators: list teachers with their unique students count (across all courses)
+router.get('/coordinator/teachers', 
+  requireCoordinator, 
+  logActivity('GET_COORDINATOR_TEACHERS'), 
+  async (req, res) => {
+    try {
+      const result = await query(`
+        SELECT 
+          COALESCE(u.id, c.teacher_id) AS teacher_id,
+          COALESCE(u.name, '(sin nombre)') AS teacher_name,
+          u.email AS teacher_email,
+          COUNT(DISTINCT COALESCE(cs.user_id::text, cs.google_id)) AS total_students,
+          COUNT(DISTINCT c.course_id) AS total_courses
+        FROM courses_cache c
+        LEFT JOIN users u ON u.id = c.teacher_id
+        LEFT JOIN course_students cs ON cs.course_id = c.course_id
+        WHERE c.teacher_id IS NOT NULL
+        GROUP BY 
+          COALESCE(u.id, c.teacher_id),
+          COALESCE(u.name, '(sin nombre)'),
+          u.email
+        ORDER BY total_students DESC NULLS LAST, teacher_name ASC
+      `);
+
+      res.json({ success: true, data: result.rows, count: result.rows.length });
+    } catch (error) {
+      logger.error('Coordinator teachers list error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch teachers' });
+    }
+  }
+);
+
+// Coordinators: list all students for a specific teacher (across all their courses)
+router.get('/coordinator/teacher-students/:teacherId', 
+  requireCoordinator, 
+  logActivity('GET_COORDINATOR_TEACHER_STUDENTS'), 
+  async (req, res) => {
+    try {
+      const { teacherId } = req.params;
+
+      const students = await query(`
+        SELECT DISTINCT 
+          COALESCE(u.id::text, cs.google_id) AS student_key,
+          COALESCE(u.name, cs.name) AS student_name,
+          COALESCE(u.email, cs.email) AS student_email
+        FROM courses_cache c
+        JOIN course_students cs ON cs.course_id = c.course_id
+        LEFT JOIN users u ON u.id = cs.user_id
+        WHERE c.teacher_id = $1
+        ORDER BY student_name ASC NULLS LAST, student_email ASC
+      `, [teacherId]);
+
+      const data = students.rows.map((r, idx) => ({ student_id: r.student_key, student_name: r.student_name, student_email: r.student_email }));
+      res.json({ success: true, data, count: data.length });
+    } catch (error) {
+      logger.error('Coordinator teacher students error:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch teacher students' });
     }
   }
 );

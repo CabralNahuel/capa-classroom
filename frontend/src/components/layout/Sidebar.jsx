@@ -17,8 +17,9 @@ const navItems = [
   { text: 'Tablero', icon: <DashboardIcon />, path: '/dashboard', roles: ['student', 'teacher', 'coordinator'] },
   // Menú de cursos removido: la navegación se hace desde las tarjetas del dashboard
   { text: 'Estudiantes', icon: <PeopleIcon />, path: '/students', roles: ['teacher', 'coordinator'] },
-  { text: 'Docentes', icon: <PeopleIcon />, path: '/teachers', roles: ['coordinator'] },
-  { text: 'Reportes', icon: <BarChartIcon />, path: '/reports', roles: ['coordinator'] },
+  // Vista de Docente (para coordinador): listado de profesores y ver sus alumnos
+  { text: 'Docente', icon: <SchoolIcon />, path: '/teacher', roles: ['coordinator'] },
+  // Panel de Coordinación (solo roles)
   { text: 'Panel de Coordinación', icon: <AdminPanelSettingsIcon />, path: '/coordinator', roles: ['coordinator'] },
 ];
 
